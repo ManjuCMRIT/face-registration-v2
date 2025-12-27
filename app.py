@@ -2,13 +2,28 @@ import streamlit as st
 import numpy as np
 from PIL import Image
 import cv2
-from io import BytesIO
 
 from firebase_utils import db, bucket
 from face_processor import load_model, get_embedding
 
-# ---------------- Quality Checks ----------------
-def is_low_light(img_np, threshold=50):
+# ===================== SETTINGS =====================
+POSES = ["Front", "Left", "Right", "Up", "Down"]
+
+# UI Config
+st.set_page_config("Face Registration", layout="centered")
+st.title("📸 Student Face Registration")
+
+
+# ===================== LOAD MODEL (Cached) =====================
+@st.cache_resource
+def load_face_model():
+    return load_model()
+
+model = load_face_model()
+
+
+# ===================== QUALITY CHECKS =====================
+def is_low_light(img_np, threshold=60):
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
     return np.mean(gray) < threshold
 
@@ -17,22 +32,18 @@ def is_blurry(img_np, threshold=110):
     return cv2.Laplacian(gray, cv2.CV_64F).var() < threshold
 
 
-# ---------------- App Setup ----------------
-st.set_page_config("Face Registration", layout="centered")
-st.title("📸 Student Face Registration Portal")
 
-model = load_model()
-POSES = ["Front", "Left", "Right", "Up", "Down"]
-
-
-# ---------------- Session ----------------
-if "step" not in st.session_state: st.session_state.step = 0
-if "embeds" not in st.session_state: st.session_state.embeds = []
-if "images" not in st.session_state: st.session_state.images = []
+# ===================== SESSION INIT =====================
+if "step" not in st.session_state:
+    st.session_state.step = 0
+if "faces" not in st.session_state:
+    st.session_state.faces = []
+if "last_image" not in st.session_state:
+    st.session_state.last_image = None
 
 
-# ---------------- Class Selection ----------------
-st.subheader("1️⃣ Select Class")
+# ===================== CLASS SELECTION =====================
+st.subheader("1. Select Class")
 
 col1, col2 = st.columns(2)
 dept = col1.selectbox("Department", ["CSE","ISE","AI/ML","CS-ML","CS-DS","AI/DS","MBA","MCA"])
@@ -44,89 +55,82 @@ if not (dept and batch and section):
 
 class_id = f"{dept}_{batch}_{section}"
 
-students_ref = db.collection("classes").document(class_id).collection("students").stream()
-students = {s.id: s.to_dict() for s in students_ref}
+# Load only USN & name (light weight)
+student_docs = db.collection("classes").document(class_id).collection("students").stream()
+students = {s.id: s.to_dict()['name'] for s in student_docs}
 
 if not students:
-    st.error("⚠ No student list found. Ask admin to upload CSV.")
+    st.error("⚠ No student list found. Admin must upload CSV first.")
     st.stop()
 
 
-# ---------------- Student Selection ----------------
-st.subheader("2️⃣ Select Your USN")
-usn = st.selectbox("Select USN", list(students.keys()))
-student = students[usn]
+# ===================== SELECT STUDENT =====================
+st.subheader("2. Select USN")
+usn = st.selectbox("USN", list(students.keys()))
+student = db.collection("classes").document(class_id).collection("students").document(usn).get().to_dict()
 
-st.info(f"👤 **{student['name']}** — {usn}")
+st.info(f"👤 Name: **{student['name']}**")
 
 if student.get("face_registered"):
-    st.warning("⚠ Face already registered. Contact admin to update.")
+    st.error("Face already registered. Contact admin to update.")
     st.stop()
 
 
-# ---------------- Pose Capture ----------------
-if st.session_state.step < 5:
+# ===================== CAPTURE POSES =====================
+st.subheader("3. Capture 5 Face Poses")
 
+# While poses are remaining
+if st.session_state.step < len(POSES):
     pose = POSES[st.session_state.step]
-    st.subheader(f"3️⃣ Capture Pose — **{pose}** ({st.session_state.step+1}/5)")
-    st.write("📌 Take photo in good light. Keep face centered.")
+    st.markdown(f"### Capture Pose: **{pose}** ({st.session_state.step+1}/5)")
 
-    file = st.camera_input(f"Capture {pose}")
+    img_file = st.camera_input(f"Capture {pose}")
 
-    if file and st.button("Save Pose"):
-        img = Image.open(file).convert("RGB")
+    if img_file and st.button("Save This Pose"):
+        img = Image.open(img_file).convert("RGB")
         img_np = np.array(img)
 
-        # quality
+        # Quality checks
         if is_low_light(img_np):
-            st.error("Too dark ❌ Try brighter light")
-            st.stop()
+            st.error("⚠ Low light. Move to brighter location."); st.stop()
+
         if is_blurry(img_np):
-            st.error("Image blurry ❌ Hold still")
-            st.stop()
+            st.error("⚠ Image blurry. Hold still."); st.stop()
 
-        embed = get_embedding(model, img_np)
-        if embed is None:
-            st.error("Face not detected ❌ Retake")
-            st.stop()
+        embedding = get_embedding(model, img_np)
+        if embedding is None:
+            st.error("No face detected. Retake image."); st.stop()
 
-        st.session_state.embeds.append(embed)
-        st.session_state.images.append(img)
+        st.session_state.faces.append(embedding)
+        st.session_state.last_image = img_file   # store last captured image
         st.session_state.step += 1
-        st.success("Pose saved ✔")
+        st.success(f"{pose} captured ✓")
         st.rerun()
 
 
-# ---------------- Final Save ----------------
+# ===================== FINAL SUBMISSION =====================
 if st.session_state.step == 5:
-    st.success("🎉 All 5 poses captured!")
+    st.success("🎉 All 5 poses captured successfully!")
 
     if st.button("Finalize Registration 🚀"):
+        final_embedding = np.mean(st.session_state.faces, axis=0).tolist()
 
-        # average embedding
-        final_embed = np.mean(st.session_state.embeds, axis=0).tolist()
+        # Save to database
+        db.collection("classes").document(class_id).collection("students").document(usn).update({
+            "embedding": final_embedding,
+            "face_registered": True
+        })
 
-        # store embedding
-        db.collection("classes").document(class_id)\
-            .collection("students").document(usn).update({
-                "embedding": final_embed,
-                "face_registered": True
-            })
-
-        # -------- upload face images properly --------
-        for i, img in enumerate(st.session_state.images):
-            buf = BytesIO()
-            img.save(buf, format="JPEG")
-            buf.seek(0)
-
-            blob = bucket.blob(f"faces/{class_id}/{usn}_{POSES[i]}.jpg")
-            blob.upload_from_file(buf, content_type="image/jpeg")
+        # Upload face preview image to storage
+        if st.session_state.last_image:
+            blob = bucket.blob(f"faces/{class_id}/{usn}.jpg")
+            blob.upload_from_string(st.session_state.last_image.read(), content_type="image/jpeg")
 
         st.balloons()
-        st.success(f"✔ Registration Completed for {student['name']}")
+        st.success(f"Face Registered for **{student['name']} ({usn})**")
 
-        # reset for next user
+        # RESET for next student
         st.session_state.step = 0
-        st.session_state.embeds = []
-        st.session_state.images = []
+        st.session_state.faces = []
+        st.session_state.last_image = None
         st.rerun()
